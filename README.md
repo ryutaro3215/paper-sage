@@ -22,6 +22,7 @@ pip install -r requirements.txt
 python process_papers.py
 
 # 手動指定
+# 論文のタイプを引数で指定（empirical, theoretical, review）
 python process_papers.py empirical
 python process_papers.py theoretical
 python process_papers.py review
