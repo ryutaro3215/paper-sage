@@ -79,14 +79,21 @@ class PaperProcessor:
         
         return detected_type
     
-    def summarize(self, text, paper_type):
+    def summarize(self, text, paper_type, language=None):
         """Claude APIで要約生成（ローディングアニメーション付き）"""
         # 対応するプロンプトを取得
         task_prompt = self.prompts.get(paper_type, self.prompts["empirical"])
         
+        # 言語指定の追加プロンプト
+        language_instruction = ""
+        if language == 'ja':
+            language_instruction = "\n**重要: 必ず日本語で要約を出力してください。**\n"
+        elif language == 'en':
+            language_instruction = "\n**Important: You must output the summary in English.**\n"
+        
         # システムプロンプトとタスクプロンプトを結合
         full_prompt = f"""{self.system_prompt}
-
+{language_instruction}
 ---
 
 {task_prompt}
@@ -130,7 +137,7 @@ class PaperProcessor:
         
         return result
     
-    def process_paper(self, pdf_path, paper_type=None):
+    def process_paper(self, pdf_path, paper_type=None, language=None):
         """論文を処理"""
         print(f"\n{'='*60}")
         print(f"📄 処理中: {pdf_path.name}")
@@ -168,7 +175,7 @@ class PaperProcessor:
         
         # 要約生成
         try:
-            summary = self.summarize(text, paper_type)
+            summary = self.summarize(text, paper_type, language)
         except Exception as e:
             print(f"  ❌ 要約エラー: {e}")
             # PDFを元に戻す
@@ -180,6 +187,7 @@ class PaperProcessor:
         metadata = f"""---
 created: {datetime.now().isoformat()}
 paper_type: {paper_type}
+language: {language if language else 'auto'}
 source: [[{pdf_path.name}]]
 ---
 
@@ -229,17 +237,60 @@ def main():
         print(f"   PDFを {processor.downloads_dir} に配置してください")
         return
     
-    # 論文タイプ指定の確認
+    # コマンドライン引数の処理
     paper_type = None
-    if len(sys.argv) > 1:
-        specified_type = sys.argv[1].lower()
-        if specified_type in ['empirical', 'theoretical', 'review']:
-            paper_type = specified_type
-            print(f"\n📌 論文タイプ指定: {paper_type}")
+    language = None
+    
+    # 使用方法の表示
+    if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
+        print("\n使用方法:")
+        print("  python process_papers.py [論文タイプ] [言語]")
+        print("\n論文タイプ:")
+        print("  empirical    - 実証論文")
+        print("  theoretical  - 理論論文")
+        print("  review       - レビュー論文")
+        print("  (指定なし)   - 自動判定")
+        print("\n言語:")
+        print("  ja / japanese  - 日本語で要約")
+        print("  en / english   - 英語で要約")
+        print("  (指定なし)     - 論文の言語に合わせる")
+        print("\n例:")
+        print("  python process_papers.py empirical ja")
+        print("  python process_papers.py theoretical en")
+        print("  python process_papers.py review")
+        print("  python process_papers.py")
+        sys.exit(0)
+    
+    # 引数パース
+    for arg in sys.argv[1:]:
+        arg_lower = arg.lower()
+        
+        # 論文タイプの判定
+        if arg_lower in ['empirical', 'theoretical', 'review']:
+            paper_type = arg_lower
+        
+        # 言語の判定
+        elif arg_lower in ['ja', 'japanese', '日本語']:
+            language = 'ja'
+        elif arg_lower in ['en', 'english', '英語']:
+            language = 'en'
+        
+        # 不明な引数
         else:
-            print(f"⚠️  警告: 不明な論文タイプ '{sys.argv[1]}'")
-            print("   有効な値: empirical, theoretical, review")
-            print("   自動判定モードで続行します\n")
+            print(f"⚠️  警告: 不明な引数 '{arg}'")
+            print("   使用方法を確認するには: python process_papers.py --help")
+    
+    # 指定内容の表示
+    if paper_type:
+        print(f"\n📌 論文タイプ指定: {paper_type}")
+    else:
+        print(f"\n📌 論文タイプ: 自動判定")
+    
+    if language:
+        lang_name = "日本語" if language == 'ja' else "英語"
+        print(f"🌐 要約言語: {lang_name}")
+    else:
+        print(f"🌐 要約言語: 論文の言語に合わせる")
     
     # 処理開始
     print(f"\n{'='*60}")
@@ -250,7 +301,7 @@ def main():
     for i, pdf in enumerate(pdfs, 1):
         print(f"\n[{i}/{len(pdfs)}]")
         try:
-            processor.process_paper(pdf, paper_type)
+            processor.process_paper(pdf, paper_type, language)
             success_count += 1
         except Exception as e:
             print(f"  ❌ 予期しないエラー: {e}")
