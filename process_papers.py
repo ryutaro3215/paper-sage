@@ -13,20 +13,22 @@ from dotenv import load_dotenv
 import sys
 import threading
 import time
+import shutil
+import re
 
 class PaperProcessor:
     def __init__(self, api_key, vault_path):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.vault_path = Path(vault_path)
         self.research_dir = self.vault_path / "MyPage/Research"
-        self.downloads_dir = self.research_dir / "downloads"
-        self.prompts_dir = self.vault_path / "_prompts"
-        
+        self.downloads_dir = self.research_dir / "_inbox/downloads"
+        self.prompts_dir = self.vault_path / "MyPage/Research/_prompts"
+
         # 論文タイプ別のディレクトリ
         self.paper_dirs = {
-            "empirical": self.research_dir / "empirical",
-            "theoretical": self.research_dir / "theoretical",
-            "review": self.research_dir / "review"
+            "empirical": self.research_dir / "papers/empirical",
+            "theoretical": self.research_dir / "papers/theoretical",
+            "review": self.research_dir / "papers/review"
         }
         
         self.load_prompts()
@@ -55,29 +57,30 @@ class PaperProcessor:
         return text
     
     def detect_paper_type(self, text):
-        """論文タイプを自動判定"""
-        text_lower = text.lower()
-        
-        # キーワードベースの判定
-        empirical_keywords = ['hypothesis', 'hypotheses', 'regression', 'sample', 'data collection', 'statistical', 'coefficient', 'variable']
-        theoretical_keywords = ['proposition', 'framework', 'conceptual', 'theorize', 'construct']
-        review_keywords = ['literature review', 'systematic review', 'meta-analysis', 'prior research']
-        
-        # スコアリング
-        empirical_score = sum(1 for kw in empirical_keywords if kw in text_lower)
-        theoretical_score = sum(1 for kw in theoretical_keywords if kw in text_lower)
-        review_score = sum(1 for kw in review_keywords if kw in text_lower)
-        
-        scores = {
-            'empirical': empirical_score,
-            'theoretical': theoretical_score,
-            'review': review_score
-        }
-        
-        detected_type = max(scores, key=scores.get)
-        print(f"  📊 判定スコア - empirical:{empirical_score}, theoretical:{theoretical_score}, review:{review_score}")
-        
-        return detected_type
+        """Claude APIで論文タイプを判定"""
+        response = self.client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{
+                "role": "user",
+                "content": f"""以下の論文（冒頭部分）のタイプを判定してください。
+必ず empirical / theoretical / review のいずれか1語のみ答えてください。
+
+- empirical: 仮説検証・データ収集・統計分析を行う実証研究
+- theoretical: 理論構築・概念フレームワーク提案が中心
+- review: 既存文献のレビュー・メタ分析が中心
+
+論文冒頭:
+{text[:3000]}
+
+回答（1語のみ）:"""
+            }]
+        )
+        result = response.content[0].text.strip().lower()
+        if result not in ["empirical", "theoretical", "review"]:
+            print(f"  ❌ 予期しない分類結果: '{result}'")
+            return None
+        return result
     
     def summarize(self, text, paper_type, language=None):
         """Claude APIで要約生成（ローディングアニメーション付き）"""
@@ -123,7 +126,7 @@ class PaperProcessor:
         try:
             message = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=3000,
+                max_tokens=5000,
                 messages=[{
                     "role": "user",
                     "content": full_prompt
@@ -137,6 +140,118 @@ class PaperProcessor:
         
         return result
     
+    def verify_hypotheses(self, text, summary):
+        """要約中の仮説記述を原文と照合して検証・修正"""
+        prompt = f"""あなたは経営学論文の査読者です。以下の【論文原文】と【要約】を照合し、要約のHypothesisセクションに仮説の読み違いや誤りがないかを厳密に確認してください。
+
+確認の手順:
+1. 【論文原文】から全ての仮説（H1, H2... またはHypothesis 1, 2...）を抽出する
+2. 【要約】のHypothesisセクションに記載された各仮説と、原文の仮説を1対1で照合する
+3. 以下の点を確認する:
+   - 仮説の方向性（正の関係・負の関係・調整効果の向き）が正確か
+   - 仮説で扱う変数・概念が正確に記述されているか
+   - 仮説の番号・対応関係が正しいか
+   - 仮説が欠落していないか
+
+修正が必要な場合は、【要約】のHypothesisセクション全体を正確な内容に書き直して出力してください。
+修正が不要な場合は「VERIFIED: 仮説の記述に問題はありません。」とだけ出力してください。
+
+【論文原文】（仮説が記載されている箇所を中心に抽出）:
+{text[:80000]}
+
+【要約】:
+{summary}
+"""
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+
+    def generate_keywords(self, text, language=None):
+        """論文の重要キーワードとその日本語訳を生成"""
+        lang_instruction = ""
+        if language == 'en':
+            lang_instruction = "Output the keyword table in English (keep Japanese column as Japanese)."
+
+        prompt = f"""以下の論文から重要なキーワードを5〜10個抽出し、必ず以下のMarkdownテーブル形式で出力してください。
+
+| キーワード | 日本語訳 | 説明（1文） |
+|-----------|----------|-------------|
+| (英語キーワード) | (日本語訳) | (その論文文脈での意味・役割を1文で) |
+
+{lang_instruction}
+- 論文のコア概念・理論・手法に絞ること
+- キーワードは論文中で実際に使われている用語を優先すること
+- テーブル以外のテキストは一切出力しないこと
+
+論文テキスト（冒頭部分）:
+{text[:8000]}
+"""
+        response = self.client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+
+    def extract_references(self, text):
+        """論文の参考文献セクションを全文抽出し、箇条書きに整形"""
+        pattern = re.compile(r'(?m)^[ \t]*(REFERENCES|References|BIBLIOGRAPHY|Bibliography|WORKS CITED|Works Cited)[ \t]*$')
+        matches = list(pattern.finditer(text))
+
+        if not matches:
+            return "（参考文献セクションが見つかりませんでした）"
+
+        # 最後のマッチ（本文中の引用ではなくセクション見出し）を使用
+        ref_start = matches[-1].start()
+        refs_text = text[ref_start:].strip()
+        print(f"\n  📍 参考文献セクション検出（テキスト位置: {ref_start:,}文字目）", end="", flush=True)
+
+        return self._format_references_as_bullets(refs_text)
+
+    def _format_references_as_bullets(self, refs_text):
+        """参考文献テキストを箇条書きに整形"""
+        lines = refs_text.splitlines()
+
+        # ヘッダー行（REFERENCES等）を除去
+        if lines:
+            lines = lines[1:]
+
+        # 参考文献の区切りパターン: 番号付き ([1], 1., 1 ) または著者名で始まる新エントリ
+        ref_start_pattern = re.compile(
+            r'^\s*(?:\[\d+\]|\d+[\.\)])\s+'  # [1] or 1. or 1)
+            r'|^\s*[A-Z][a-z]+,\s'            # Author, (author-year style)
+        )
+
+        entries = []
+        current_entry = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                # 空行は区切りの可能性 - 現エントリを確定
+                if current_entry:
+                    entries.append(' '.join(current_entry))
+                    current_entry = []
+            elif ref_start_pattern.match(line):
+                # 新しい参考文献エントリの始まり
+                if current_entry:
+                    entries.append(' '.join(current_entry))
+                current_entry = [stripped]
+            else:
+                # 継続行
+                current_entry.append(stripped)
+
+        if current_entry:
+            entries.append(' '.join(current_entry))
+
+        if not entries:
+            return refs_text  # 整形失敗時はそのまま返す
+
+        return '\n'.join(f'- {entry}' for entry in entries if entry.strip())
+
     def process_paper(self, pdf_path, paper_type=None, language=None):
         """論文を処理"""
         print(f"\n{'='*60}")
@@ -154,6 +269,9 @@ class PaperProcessor:
         # 論文タイプ判定（指定がない場合）
         if paper_type is None:
             paper_type = self.detect_paper_type(text)
+            if paper_type is None:
+                print(f"  ❌ 論文タイプを判定できませんでした。処理を中止します。")
+                return
             print(f"  📋 判定結果: {paper_type}")
         else:
             print(f"  📋 指定タイプ: {paper_type}")
@@ -181,9 +299,49 @@ class PaperProcessor:
             # PDFを元に戻す
             new_pdf_path.rename(pdf_path)
             return
-        
+
+        # 仮説の検証（empiricalのみ）
+        if paper_type == "empirical":
+            try:
+                print(f"  🔍 仮説を原文と照合中...", end="", flush=True)
+                verification = self.verify_hypotheses(text, summary)
+                if verification.startswith("VERIFIED"):
+                    print(f"\r  ✅ 仮説の検証完了: 問題なし                    ")
+                else:
+                    print(f"\r  ⚠️  仮説に修正が必要です。修正を適用します...                    ")
+                    import re as _re
+                    hypothesis_pattern = _re.compile(
+                        r'(##\s*(?:\d+\.\s*)?(?:\*\*)?Hypothesis(?:\*\*)?.*?)(?=\n##\s*(?:\d+\.\s*)?\*?\*?[A-Z])',
+                        _re.DOTALL
+                    )
+                    if hypothesis_pattern.search(summary):
+                        summary = hypothesis_pattern.sub(verification + "\n\n", summary, count=1)
+                    else:
+                        summary = summary + f"\n\n---\n\n> **[仮説検証メモ]** 以下の修正が検出されました:\n>\n> " + verification.replace('\n', '\n> ')
+                    print(f"  ✅ 仮説の修正を適用しました")
+            except Exception as e:
+                print(f"\n  ⚠️  仮説検証失敗 (スキップします): {e}")
+
+        # キーワード生成
+        try:
+            print(f"  🔑 キーワード抽出中...", end="", flush=True)
+            keywords = self.generate_keywords(text, language)
+            print(f"\r  ✅ キーワード抽出完了                    ")
+            summary = summary + "\n\n---\n\n## 重要キーワード\n\n" + keywords
+        except Exception as e:
+            print(f"\n  ⚠️  キーワード抽出失敗 (要約のみ保存): {e}")
+
+        # 参考文献抽出
+        try:
+            print(f"  📚 参考文献抽出中...", end="", flush=True)
+            references = self.extract_references(text)
+            print(f"\r  ✅ 参考文献抽出完了                    ")
+            summary = summary + "\n\n---\n\n## 参考文献\n\n" + references
+        except Exception as e:
+            print(f"\n  ⚠️  参考文献抽出失敗 (スキップします): {e}")
+
         # Markdown保存
-        summary_path = paper_dir / "summary.md"
+        summary_path = paper_dir / f"{pdf_path.stem}_summary.md"
         metadata = f"""---
 created: {datetime.now().isoformat()}
 paper_type: {paper_type}
@@ -194,7 +352,7 @@ source: [[{pdf_path.name}]]
 """
         try:
             summary_path.write_text(metadata + summary, encoding='utf-8')
-            print(f"  ✅ 保存完了: summary.md")
+            print(f"  ✅ 保存完了: {pdf_path.stem}_summary.md")
         except Exception as e:
             print(f"  ❌ 保存エラー: {e}")
 
@@ -239,7 +397,7 @@ def main():
     
     # コマンドライン引数の処理
     paper_type = None
-    language = None
+    language = 'ja'
     
     # 使用方法の表示
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
