@@ -45,24 +45,28 @@ class PaperPatcher:
         if language == "en":
             lang_instruction = "Output the keyword table in English (keep Japanese column as Japanese)."
 
-        prompt = f"""以下の論文から重要なキーワードを5〜10個抽出し、必ず以下のMarkdownテーブル形式で出力してください。
-
-| キーワード | 日本語訳 | 説明（1文） |
-|-----------|----------|-------------|
-| (英語キーワード) | (日本語訳) | (その論文文脈での意味・役割を1文で) |
-
-{lang_instruction}
-- 論文のコア概念・理論・手法に絞ること
-- キーワードは論文中で実際に使われている用語を優先すること
-- テーブル以外のテキストは一切出力しないこと
-
-論文テキスト（冒頭部分）:
-{text[:8000]}
-"""
+        static_instruction = (
+            "以下の論文から重要なキーワードを5〜10個抽出し、必ず以下のMarkdownテーブル形式で出力してください。\n\n"
+            "| キーワード | 日本語訳 | 説明（1文） |\n"
+            "|-----------|----------|-------------|\n"
+            "| (英語キーワード) | (日本語訳) | (その論文文脈での意味・役割を1文で) |\n\n"
+            f"{lang_instruction}\n"
+            "- 論文のコア概念・理論・手法に絞ること\n"
+            "- キーワードは論文中で実際に使われている用語を優先すること\n"
+            "- テーブル以外のテキストは一切出力しないこと"
+        )
         response = self.client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}],
+            system=[{
+                "type": "text",
+                "text": static_instruction,
+                "cache_control": {"type": "ephemeral"}
+            }],
+            messages=[{
+                "role": "user",
+                "content": f"論文テキスト（冒頭部分）:\n{text[:8000]}"
+            }],
         )
         return response.content[0].text.strip()
 
@@ -85,18 +89,23 @@ class PaperPatcher:
         if not refs_text:
             return "（参考文献セクションが見つかりませんでした）"
 
-        prompt = f"""以下は論文の参考文献セクションです。各文献を箇条書きリスト形式（"- " で始める）で1行ずつ出力してください。
-
-- 見出し行（REFERENCESなど）は除いてください
-- リスト以外のテキストは一切出力しないこと
-
-参考文献セクション:
-{refs_text}
-"""
+        static_instruction = (
+            '以下は論文の参考文献セクションです。各文献を箇条書きリスト形式（"- " で始める）で1行ずつ出力してください。\n\n'
+            "- 見出し行（REFERENCESなど）は除いてください\n"
+            "- リスト以外のテキストは一切出力しないこと"
+        )
         response = self.client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
+            system=[{
+                "type": "text",
+                "text": static_instruction,
+                "cache_control": {"type": "ephemeral"}
+            }],
+            messages=[{
+                "role": "user",
+                "content": f"参考文献セクション:\n{refs_text}"
+            }],
         )
         return response.content[0].text.strip()
 
@@ -245,9 +254,9 @@ def main():
         print("❌ エラー: OBSIDIAN_VAULT_PATH が設定されていません")
         sys.exit(1)
 
-    research_dir = Path(vault_path) / "MyPage/Research"
+    research_dir = Path(vault_path) / "MyPage/Management/papers"
     if not research_dir.exists():
-        print(f"❌ エラー: Research ディレクトリが見つかりません: {research_dir}")
+        print(f"❌ エラー: Management/papers ディレクトリが見つかりません: {research_dir}")
         sys.exit(1)
 
     patcher = PaperPatcher(api_key, research_dir)
