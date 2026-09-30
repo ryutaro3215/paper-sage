@@ -20,9 +20,26 @@ import re
 import json
 
 class PaperProcessor:
-    # 要約生成用モデル（高品質）と補助タスク用モデル（軽量・安価）
+    # 要約生成用モデル。論文テキストはこのモデルへの1回の呼び出しでのみ入力する
     SUMMARY_MODEL = "claude-sonnet-5"
-    LIGHT_MODEL = "claude-haiku-4-5-20251001"
+    SUMMARY_MAX_TOKENS = 64000
+
+    # 要約本文の後に続けて出力させる付録（重要キーワード）と、frontmatter 用のコンセプト
+    APPENDIX_INSTRUCTIONS = """【追加出力】上記の出力形式ルールに加えて、要約本文（最後の項目）の後に、続けて以下のセクションと <concepts> ブロックをこの順で出力してください。本文と同じ言語方針に従ってください。
+
+## 重要キーワード
+論文のコア概念・理論・手法に関する重要キーワードを5〜10個、以下のMarkdownテーブルで出力する（論文中で実際に使われている用語を優先する。「日本語訳」列は日本語で書く）。
+
+| キーワード | 日本語訳 | 説明（1文） |
+|-----------|----------|-------------|
+| (英語キーワード) | (日本語訳) | (その論文文脈での意味・役割を1文で) |
+
+最後に、論文の主要な学術概念を2〜4個、CamelCase（例: CompetitiveStrategy, TopManagementTeam）で <concepts> タグの中に1行1つずつ出力する。タグの外には何も書かないこと。
+
+<concepts>
+ConceptOne
+ConceptTwo
+</concepts>"""
 
     # 論文タイプ判定用（TypeSafe AI Jev）
     JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
@@ -53,12 +70,10 @@ class PaperProcessor:
         """プロンプトファイルを読み込み"""
         try:
             self.system_prompt = (self.prompts_dir / "system.md").read_text(encoding='utf-8')
-            self.prompts = {}
-            for pt in ["empirical", "theoretical", "review"]:
-                self.prompts[pt] = {
-                    "detailed": (self.prompts_dir / f"{pt}.md").read_text(encoding='utf-8'),
-                    "simple":   (self.prompts_dir / f"{pt}_simple.md").read_text(encoding='utf-8'),
-                }
+            self.prompts = {
+                pt: (self.prompts_dir / f"{pt}_simple.md").read_text(encoding='utf-8')
+                for pt in ["empirical", "theoretical", "review"]
+            }
             print("✅ プロンプトファイル読み込み完了")
         except FileNotFoundError as e:
             print(f"❌ エラー: プロンプトファイルが見つかりません: {e}")
@@ -115,30 +130,58 @@ class PaperProcessor:
         print("  🔍 Jev確率: " + ", ".join(f"{k}={v:.2f}" for k, v in probabilities.items()))
         return max(probabilities, key=probabilities.get)
 
-    def summarize(self, text, paper_type, language=None, detail='detailed'):
-        """Claude APIで要約生成（ローディングアニメーション付き）"""
-        task_prompt = self.prompts[paper_type][detail]
-        
-        # 言語指定の追加プロンプト
-        language_instruction = ""
-        if language == 'ja':
-            language_instruction = "\n**重要: 必ず日本語で要約を出力してください。**\n"
-        elif language == 'en':
-            language_instruction = "\n**Important: You must output the summary in English.**\n"
-        
-        # システムプロンプトとタスクプロンプトを結合（キャッシュ対象）
-        static_system = f"{self.system_prompt}\n{language_instruction}\n---\n\n{task_prompt}\n\n---"
+    def _concept_registry_text(self, cache: Optional[dict]) -> str:
+        """cache.json の concept_registry を、既存概念を優先選択させる指示文に変換
 
-        print(f"  🤖 Claude API呼び出し中", end="", flush=True)
+        参照先: wiki/CLAUDE.md, MyPage/CLAUDE.md の Frontmatter スキーマ
+        """
+        existing: list[str] = []
+        if cache:
+            registry = cache.get('concept_registry', {})
+            if isinstance(registry, dict):
+                for k, v in registry.items():
+                    if isinstance(v, list):    # 旧形式: {ドメイン: [概念, ...]}
+                        existing.extend(v)
+                    else:                      # v2形式: {概念: ドメイン}
+                        existing.append(k)
+            elif isinstance(registry, list):
+                existing = list(registry)
+            # 並び順を固定してプロンプトキャッシュを安定させる
+            existing = sorted(set(existing))
+        if not existing:
+            return "登録済み概念一覧: （なし）"
+        return (
+            "<concepts> に出力する概念は、以下の登録済み概念一覧から優先的に選ぶこと。"
+            "一覧にない概念が必要な場合のみ新規作成してよい。\n"
+            "登録済み概念一覧:\n" + '\n'.join(f'- {c}' for c in existing)
+        )
 
-        # ローディングアニメーション
+    def _build_system(self, paper_type, cache):
+        """要約・付録・コンセプトを1回で出力させるシステムプロンプトを組み立てる（出力言語は英語固定）"""
+        static_system = (
+            f"{self.system_prompt}\n\n---\n\n"
+            f"{self.prompts[paper_type]}\n\n---\n\n{self.APPENDIX_INSTRUCTIONS}"
+        )
+        # 論文間で共通のプレフィックスをキャッシュする（最後のブロックに付けると両ブロックが対象）
+        return [
+            {"type": "text", "text": static_system},
+            {"type": "text", "text": self._concept_registry_text(cache),
+             "cache_control": {"type": "ephemeral"}},
+        ]
+
+    def _stream_message(self, system, user_content, label):
+        """Claude API を1回呼び出して全文を返す（ローディングアニメーション付き）
+
+        出力が長いため、HTTPタイムアウトを避けるようストリーミングで受信する。
+        """
+        print(f"  🤖 {label}", end="", flush=True)
         stop_loading = threading.Event()
 
         def loading_animation():
             frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             idx = 0
             while not stop_loading.is_set():
-                print(f"\r  🤖 Claude API呼び出し中 {frames[idx % len(frames)]}", end="", flush=True)
+                print(f"\r  🤖 {label} {frames[idx % len(frames)]}", end="", flush=True)
                 idx += 1
                 time.sleep(0.1)
 
@@ -147,137 +190,57 @@ class PaperProcessor:
 
         is_complete = False
         try:
-            message = self.client.messages.create(
+            with self.client.messages.stream(
                 model=self.SUMMARY_MODEL,
-                max_tokens=8192,
-                system=[{
-                    "type": "text",
-                    "text": static_system,
-                    "cache_control": {"type": "ephemeral"}
-                }],
-                messages=[{
-                    "role": "user",
-                    "content": f"論文テキスト:\n{text[:100000]}"
-                }]
-            )
-            text_block = next((b for b in message.content if b.type == 'text'), None)
-            result = text_block.text if text_block else ""
+                max_tokens=self.SUMMARY_MAX_TOKENS,
+                system=system,
+                messages=[{"role": "user", "content": user_content}],
+            ) as stream:
+                message = stream.get_final_message()
+            if message.stop_reason == "refusal":
+                raise RuntimeError("Claude が要約を拒否しました (stop_reason: refusal)")
+            result = "".join(b.text for b in message.content if b.type == 'text')
             is_complete = message.stop_reason != "max_tokens"
         finally:
             stop_loading.set()
             loading_thread.join()
             if is_complete:
-                print(f"\r  ✅ Claude API呼び出し完了                    ")
+                print(f"\r  ✅ {label}完了                    ")
             else:
-                print(f"\r  ⚠️  max_tokensに達しました（要約が途中で切れています）")
+                print(f"\r  ⚠️  {label}: max_tokensに達したか失敗しました")
 
+        usage = message.usage
+        print(
+            f"  📊 tokens: input={usage.input_tokens:,} "
+            f"cache_read={usage.cache_read_input_tokens or 0:,} "
+            f"cache_write={usage.cache_creation_input_tokens or 0:,} "
+            f"output={usage.output_tokens:,}"
+        )
         return result, is_complete
-    
-    def _extract_hypothesis_text(self, text: str) -> str:
-        """仮説文のみを原文から抽出してトークンを節約"""
-        hyp_lines = re.findall(
-            r'(?m)^.{0,20}(?:Hypothesis|Proposition|H\d+)[:\s].{10,400}',
-            text
-        )
-        extracted = '\n'.join(hyp_lines[:30])
-        if len(extracted) > 300:
-            return extracted
-        # フォールバック: 本文中盤（仮説が集中しやすい箇所）
-        mid = len(text) // 3
-        return text[mid:mid + 15000]
 
-    def verify_hypotheses(self, text, summary):
-        """要約中の仮説記述を原文と照合して検証・修正"""
-        hyp_text = self._extract_hypothesis_text(text)
-        static_instruction = (
-            "経営学論文の査読者として、【原文の仮説】と【要約】のHypothesisセクションを照合してください。\n\n"
-            "確認項目: 仮説の方向性（正・負・調整効果の向き）、変数・概念の正確さ、番号対応、欠落の有無\n\n"
-            "修正が必要な場合はHypothesisセクション全体を正確に書き直して出力してください。\n"
-            "修正不要な場合は「VERIFIED: 仮説の記述に問題はありません。」とだけ出力してください。"
+    def summarize(self, text, paper_type, cache=None):
+        """要約本文・キーワード・コンセプトを1回のAPI呼び出しで生成（論文は全文を入力）"""
+        return self._stream_message(
+            self._build_system(paper_type, cache),
+            f"論文テキスト:\n{text}",
+            "Claude API呼び出し中",
         )
-        response = self.client.messages.create(
-            model=self.LIGHT_MODEL,
-            max_tokens=2000,
-            system=[{
-                "type": "text",
-                "text": static_instruction,
-                "cache_control": {"type": "ephemeral"}
-            }],
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"【原文の仮説】:\n{hyp_text}\n\n"
-                    f"【要約】:\n{summary}"
-                )
-            }]
-        )
-        return response.content[0].text.strip()
 
-    def generate_core_concepts_section(self, text, language=None):
-        """論文のコア概念（3〜5個）を定義・役割・理論的出自とともに生成"""
-        lang_instruction = ""
-        if language == 'ja':
-            lang_instruction = "必ず日本語で出力してください。"
-        elif language == 'en':
-            lang_instruction = "Output in English."
+    def _parse_output(self, raw: str):
+        """モデル出力から <concepts> を取り出し、付録セクションの区切り線を整える
 
-        static_instruction = (
-            "以下の経営学論文に登場するコア概念を3〜5個抽出し、各概念について以下の形式で出力してください。\n\n"
-            "### {概念名}\n"
-            "- **定義**: （その論文での定義・意味）\n"
-            "- **論文での役割**: （独立変数・媒介変数・理論的基盤など、論文内での位置づけ）\n"
-            "- **理論的出自**: （提唱者・理論名・原著など）\n\n"
-            "ルール:\n"
-            "- 分析の中核を成す概念のみを選ぶこと（測定手法・サンプル属性などは除く）\n"
-            "- 論文内で実際に定義・使用されている用語を優先すること\n"
-            "- 上記フォーマット以外のテキストは一切出力しないこと\n"
-            f"{lang_instruction}"
-        )
-        response = self.client.messages.create(
-            model=self.LIGHT_MODEL,
-            max_tokens=1500,
-            system=[{
-                "type": "text",
-                "text": static_instruction,
-                "cache_control": {"type": "ephemeral"}
-            }],
-            messages=[{
-                "role": "user",
-                "content": f"論文テキスト（冒頭部分）:\n{text[:12000]}"
-            }]
-        )
-        return response.content[0].text.strip()
-
-    def generate_keywords(self, text, language=None):
-        """論文の重要キーワードとその日本語訳を生成"""
-        lang_instruction = ""
-        if language == 'en':
-            lang_instruction = "Output the keyword table in English (keep Japanese column as Japanese)."
-
-        static_instruction = (
-            "以下の論文から重要なキーワードを5〜10個抽出し、必ず以下のMarkdownテーブル形式で出力してください。\n\n"
-            "| キーワード | 日本語訳 | 説明（1文） |\n"
-            "|-----------|----------|-------------|\n"
-            "| (英語キーワード) | (日本語訳) | (その論文文脈での意味・役割を1文で) |\n\n"
-            f"{lang_instruction}\n"
-            "- 論文のコア概念・理論・手法に絞ること\n"
-            "- キーワードは論文中で実際に使われている用語を優先すること\n"
-            "- テーブル以外のテキストは一切出力しないこと"
-        )
-        response = self.client.messages.create(
-            model=self.LIGHT_MODEL,
-            max_tokens=1000,
-            system=[{
-                "type": "text",
-                "text": static_instruction,
-                "cache_control": {"type": "ephemeral"}
-            }],
-            messages=[{
-                "role": "user",
-                "content": f"論文テキスト（冒頭部分）:\n{text[:8000]}"
-            }]
-        )
-        return response.content[0].text.strip()
+        Returns: (本文, concepts のリスト)
+        """
+        concepts = []
+        match = re.search(r'<concepts>(.*?)</concepts>', raw, re.DOTALL)
+        if match:
+            concepts = [l.strip().lstrip('- ').strip() for l in match.group(1).splitlines()]
+            concepts = [c for c in concepts if c]
+            raw = raw[:match.start()] + raw[match.end():]
+        body = raw.strip()
+        # 付録セクションの前は常に「---」1本で区切る
+        body = re.sub(r'\n+(?:---\n+)?(?=## 重要キーワード\n)', '\n\n---\n\n', body)
+        return body, concepts
 
     def load_cache(self) -> dict:
         """wiki/cache.json を読み込む（存在しない場合は空dictを返す）
@@ -295,48 +258,6 @@ class PaperProcessor:
             print(f"  ⚠️  cache.json 読み込み失敗: {e}")
             return {}
 
-    def generate_concepts(self, text: str, cache: Optional[dict] = None) -> list[str]:
-        """論文の主要な学術概念をCamelCaseで生成
-
-        cache が渡された場合は concept_registry の登録済み概念を優先選択する。
-        一覧にない概念が必要な場合のみ新規作成する（MyPage/CLAUDE.md の命名規則に従う）。
-        """
-        existing: list[str] = []
-        if cache:
-            registry = cache.get('concept_registry', {})
-            if isinstance(registry, dict):
-                for v in registry.values():
-                    if isinstance(v, list):
-                        existing.extend(v)
-            elif isinstance(registry, list):
-                existing = list(registry)
-
-        registry_instruction = ""
-        if existing:
-            registry_instruction = (
-                "\n\n登録済み概念一覧（優先的に使用すること）:\n"
-                + '\n'.join(f'- {c}' for c in existing)
-                + "\n一覧にない概念が必要な場合のみ新規作成してよい。"
-            )
-
-        response = self.client.messages.create(
-            model=self.LIGHT_MODEL,
-            max_tokens=200,
-            system=[{
-                "type": "text",
-                "text": (
-                    "以下の経営学論文から、主要な学術概念を2〜4個抽出してください。\n"
-                    "概念名はCamelCase（例: CompetitiveStrategy, TopManagementTeam）で出力し、\n"
-                    "各概念を改行で区切って出力してください。それ以外のテキストは一切出力しないこと。"
-                    + registry_instruction
-                ),
-                "cache_control": {"type": "ephemeral"}
-            }],
-            messages=[{"role": "user", "content": f"論文冒頭:\n{text[:5000]}"}]
-        )
-        lines = response.content[0].text.strip().splitlines()
-        return [l.strip() for l in lines if l.strip()]
-
     def _strip_frontmatter(self, content: str) -> str:
         """YAMLフロントマターを除去して本文を返す"""
         if content.startswith('---'):
@@ -345,73 +266,28 @@ class PaperProcessor:
                 return parts[2].strip()
         return content
 
+    REFERENCES_MARKER = '\n\n---\n\n## 参考文献'
+
     def _split_main_and_appended(self, body: str):
-        """本文とコア概念・キーワード・参考文献セクションを分離して返す"""
-        for marker in ['\n\n---\n\n## コア概念', '\n\n---\n\n## 重要キーワード']:
-            idx = body.find(marker)
-            if idx != -1:
-                return body[:idx], body[idx:]
+        """モデルが生成した部分と、コードが追記した参考文献セクションを分離して返す"""
+        idx = body.find(self.REFERENCES_MARKER)
+        if idx != -1:
+            return body[:idx], body[idx:]
         return body, ''
 
-    def resume_summary(self, text, paper_type, language, existing_summary, detail='detailed'):
-        """途中で切れた要約の続きを生成"""
-        task_prompt = self.prompts[paper_type][detail]
-
-        language_instruction = ""
-        if language == 'ja':
-            language_instruction = "\n**重要: 必ず日本語で要約を出力してください。**\n"
-        elif language == 'en':
-            language_instruction = "\n**Important: You must output the summary in English.**\n"
-
-        static_system = (
-            f"{self.system_prompt}\n{language_instruction}\n---\n\n{task_prompt}\n\n---\n\n"
-            "【追加指示】以下の【既存の要約】は途中で切れています。"
-            "上記フォーマットに基づき、未記載・未完成のセクションのみを続きから出力してください。"
-            "既存の内容は繰り返さないこと。"
+    def resume_summary(self, text, paper_type, existing_summary, cache=None):
+        """途中で切れた出力の続きを生成（システムプロンプトは通常時と共通にしてキャッシュを再利用）"""
+        return self._stream_message(
+            self._build_system(paper_type, cache),
+            (
+                f"論文テキスト:\n{text}\n\n"
+                f"【既存の出力（途中まで）】:\n{existing_summary}\n\n"
+                "【追加指示】上記の既存の出力は途中で切れています。"
+                "指定フォーマットに基づき、未記載・未完成のセクション（付録と <concepts> を含む）のみを続きから出力してください。"
+                "既存の内容は繰り返さないこと。"
+            ),
+            "続きを生成中",
         )
-
-        print(f"  🔄 続きを生成中", end="", flush=True)
-        stop_loading = threading.Event()
-
-        def loading_animation():
-            frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-            idx = 0
-            while not stop_loading.is_set():
-                print(f"\r  🔄 続きを生成中 {frames[idx % len(frames)]}", end="", flush=True)
-                idx += 1
-                time.sleep(0.1)
-
-        loading_thread = threading.Thread(target=loading_animation, daemon=True)
-        loading_thread.start()
-
-        is_complete = False
-        try:
-            message = self.client.messages.create(
-                model=self.SUMMARY_MODEL,
-                max_tokens=8192,
-                system=[{
-                    "type": "text",
-                    "text": static_system,
-                    "cache_control": {"type": "ephemeral"}
-                }],
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"論文テキスト:\n{text[:100000]}\n\n"
-                        f"【既存の要約（途中まで）】:\n{existing_summary}"
-                    )
-                }]
-            )
-            text_block = next((b for b in message.content if b.type == 'text'), None)
-            result = text_block.text if text_block else ""
-            is_complete = message.stop_reason != "max_tokens"
-        finally:
-            stop_loading.set()
-            loading_thread.join()
-            status = "✅ 続きの生成完了" if is_complete else "⚠️  まだ途中で切れています"
-            print(f"\r  {status}                    ")
-
-        return result, is_complete
 
     def find_incomplete_summaries(self) -> list:
         """status: incomplete のサマリーファイルを収集"""
@@ -439,15 +315,6 @@ class PaperProcessor:
         existing_content = summary_path.read_text(encoding='utf-8')
         type_match = re.search(r'^paper_type:\s*(\S+)', existing_content, re.MULTILINE)
         paper_type = type_match.group(1) if type_match else 'empirical'
-        lang_match = re.search(r'^language:\s*(\S+)', existing_content, re.MULTILINE)
-        language = lang_match.group(1) if lang_match else 'ja'
-        if language == 'auto':
-            language = None
-        # detail を frontmatter から復元（旧ファイルには存在しないため 'detailed' にフォールバック）
-        detail_match = re.search(r'^detail:\s*(\S+)', existing_content, re.MULTILINE)
-        detail = detail_match.group(1) if detail_match else 'detailed'
-        if detail not in ('detailed', 'simple'):
-            detail = 'detailed'
 
         try:
             text = self.extract_text(pdf_path)
@@ -460,15 +327,17 @@ class PaperProcessor:
         main_summary, appended = self._split_main_and_appended(body)
 
         try:
-            continuation, is_complete = self.resume_summary(text, paper_type, language, main_summary, detail)
+            continuation, is_complete = self.resume_summary(
+                text, paper_type, main_summary, self.load_cache())
         except Exception as e:
             print(f"  ❌ 続き生成エラー: {e}")
             return False
 
-        full_summary = main_summary + '\n\n' + continuation + appended
+        generated, concepts = self._parse_output(main_summary + '\n\n' + continuation)
+        full_summary = generated + appended
         status = 'complete' if is_complete else 'incomplete'
 
-        # 既存 frontmatter を保持し status フィールドのみ更新
+        # 既存 frontmatter を保持し status（と続きで得られた concept）のみ更新
         if existing_content.startswith('---'):
             parts = existing_content.split('---', 2)
             fm_block = parts[1]
@@ -476,6 +345,10 @@ class PaperProcessor:
                 fm_block = re.sub(r'^status:\s*\S+', f'status: {status}', fm_block, count=1, flags=re.MULTILINE)
             else:
                 fm_block += f'status: {status}\n'
+            if concepts:
+                concept_yaml = ''.join(f'  - {c}\n' for c in concepts)
+                fm_block = re.sub(r'^concept:\n(?:  - .*\n)*', f'concept:\n{concept_yaml}',
+                                  fm_block, count=1, flags=re.MULTILINE)
             new_file_content = '---' + fm_block + '---\n\n' + full_summary
         else:
             new_file_content = full_summary
@@ -581,8 +454,8 @@ tags:
   - {paper_type_tag}
 created: {datetime.now().isoformat()}
 paper_type: {paper_type}
-language: ja
-detail: detailed
+language: en
+detail: simple
 source: "[[{pdf_path.name}]]"
 status: unprocessable
 ---
@@ -595,7 +468,7 @@ status: unprocessable
             print(f"  ❌ サマリー作成エラー: {e}")
             return False
 
-    def process_paper(self, pdf_path, paper_type=None, language=None, detail='detailed'):
+    def process_paper(self, pdf_path, paper_type=None):
         """論文を処理"""
         print(f"\n{'='*60}")
         print(f"📄 処理中: {pdf_path.name}")
@@ -634,49 +507,23 @@ status: unprocessable
             print(f"  ❌ PDF移動エラー: {e}")
             return
         
-        # 要約生成
+        # 要約・キーワード・コンセプトを1回の呼び出しで生成
+        # （cache.json の concept_registry から既存概念を優先選択させる）
         try:
-            summary, is_complete = self.summarize(text, paper_type, language, detail)
+            raw, is_complete = self.summarize(text, paper_type, self.load_cache())
         except Exception as e:
             print(f"  ❌ 要約エラー: {e}")
             # PDFを元に戻す
             new_pdf_path.rename(pdf_path)
             return
+        summary, concepts = self._parse_output(raw)
 
-        # コンセプト生成（cache.json の concept_registry から既存概念を優先選択）
-        cache = self.load_cache()
-        concepts = []
-        try:
-            print(f"  💡 コンセプト抽出中...", end="", flush=True)
-            concepts = self.generate_concepts(text, cache)
-            print(f"\r  ✅ コンセプト抽出完了                    ")
-        except Exception as e:
-            print(f"\n  ⚠️  コンセプト抽出失敗: {e}")
-
-        # コア概念生成
-        try:
-            print(f"  💎 コア概念抽出中...", end="", flush=True)
-            core_concepts = self.generate_core_concepts_section(text, language)
-            print(f"\r  ✅ コア概念抽出完了                    ")
-            summary = summary + "\n\n---\n\n## コア概念\n\n" + core_concepts
-        except Exception as e:
-            print(f"\n  ⚠️  コア概念抽出失敗 (スキップします): {e}")
-
-        # キーワード生成
-        try:
-            print(f"  🔑 キーワード抽出中...", end="", flush=True)
-            keywords = self.generate_keywords(text, language)
-            print(f"\r  ✅ キーワード抽出完了                    ")
-            summary = summary + "\n\n---\n\n## 重要キーワード\n\n" + keywords
-        except Exception as e:
-            print(f"\n  ⚠️  キーワード抽出失敗 (要約のみ保存): {e}")
-
-        # 参考文献抽出
+        # 参考文献抽出（API呼び出しなし）
         try:
             print(f"  📚 参考文献抽出中...", end="", flush=True)
             references = self.extract_references(text)
             print(f"\r  ✅ 参考文献抽出完了                    ")
-            summary = summary + "\n\n---\n\n## 参考文献\n\n" + references
+            summary = summary + self.REFERENCES_MARKER + "\n\n" + references
         except Exception as e:
             print(f"\n  ⚠️  参考文献抽出失敗 (スキップします): {e}")
 
@@ -702,8 +549,8 @@ tags:
   - {paper_type_tag}
 created: {datetime.now().isoformat()}
 paper_type: {paper_type}
-language: {language if language else 'auto'}
-detail: {detail}
+language: en
+detail: simple
 source: "[[{pdf_path.name}]]"
 status: {status}
 ---
@@ -761,29 +608,22 @@ def main():
     
     # コマンドライン引数の処理
     paper_type = None
-    language = 'ja'
-    detail = 'detailed'
     rescue_mode = False
 
     # 使用方法の表示
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
         print("\n使用方法:")
-        print("  python process_papers.py [論文タイプ] [言語] [--rescue]")
+        print("  python process_papers.py [論文タイプ] [--rescue]")
         print("\n論文タイプ:")
         print("  empirical    - 実証論文")
         print("  theoretical  - 理論論文")
         print("  review       - レビュー論文")
         print("  (指定なし)   - 自動判定（通常モードのみ）")
-        print("\n言語:")
-        print("  ja / japanese  - 日本語で要約")
-        print("  en / english   - 英語で要約")
-        print("  (指定なし)     - 論文の言語に合わせる")
         print("\nオプション:")
         print("  --rescue     - PDFを指定タイプに移動してフロントマターのみのサマリーを作成（要約しない）")
         print("                 論文タイプの指定が必須")
         print("\n例:")
-        print("  python process_papers.py empirical ja")
-        print("  python process_papers.py theoretical en")
+        print("  python process_papers.py empirical")
         print("  python process_papers.py review")
         print("  python process_papers.py")
         print("  python process_papers.py empirical --rescue")
@@ -800,18 +640,6 @@ def main():
         # 論文タイプの判定
         elif arg_lower in ['empirical', 'theoretical', 'review']:
             paper_type = arg_lower
-
-        # 詳細度の判定
-        elif arg_lower in ['simple', '簡易']:
-            detail = 'simple'
-        elif arg_lower in ['detailed', '詳細']:
-            detail = 'detailed'
-
-        # 言語の判定
-        elif arg_lower in ['ja', 'japanese', '日本語']:
-            language = 'ja'
-        elif arg_lower in ['en', 'english', '英語']:
-            language = 'en'
 
         # 不明な引数
         else:
@@ -851,14 +679,7 @@ def main():
     else:
         print(f"\n📌 論文タイプ: 自動判定")
 
-    if language:
-        lang_name = "日本語" if language == 'ja' else "英語"
-        print(f"🌐 要約言語: {lang_name}")
-    else:
-        print(f"🌐 要約言語: 論文の言語に合わせる")
-
-    detail_name = "簡易" if detail == 'simple' else "詳細"
-    print(f"📝 要約モード: {detail_name}")
+    print(f"🌐 要約言語: 英語")
 
     # 処理開始
     print(f"\n{'='*60}")
@@ -869,7 +690,7 @@ def main():
     for i, pdf in enumerate(pdfs, 1):
         print(f"\n[{i}/{len(pdfs)}]")
         try:
-            processor.process_paper(pdf, paper_type, language, detail)
+            processor.process_paper(pdf, paper_type)
             success_count += 1
         except Exception as e:
             print(f"  ❌ 予期しないエラー: {e}")
