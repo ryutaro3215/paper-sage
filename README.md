@@ -19,8 +19,10 @@ source venv/bin/activate
 # 依存関係をインストール
 pip install -r requirements.txt
 
-# .envファイルにAPI keyを設定
-echo "ANTHROPIC_API_KEY=your-key-here" >> .env
+# Claude Code CLI をインストールし、サブスクでログイン（APIキーは不要）
+claude login
+
+# .envファイルを設定
 echo "OBSIDIAN_VAULT_PATH=/Users/username/Documents/Obsidian Vault" >> .env
 ```
 
@@ -35,7 +37,7 @@ echo "OBSIDIAN_VAULT_PATH=/Users/username/Documents/Obsidian Vault" >> .env
 ### コマンド形式
 
 ```bash
-python process_papers.py [論文タイプ] [言語]
+python process_papers.py [論文タイプ] [ファイル名.pdf]
 ```
 
 ### 論文タイプ指定
@@ -54,34 +56,19 @@ python process_papers.py theoretical
 python process_papers.py review
 ```
 
-### 言語指定
+### 1本だけ指定して処理
 
 ```bash
-# 日本語で要約
-python process_papers.py ja
+# downloads内の特定のPDFだけを処理
+python process_papers.py paper.pdf
 
-# 英語で要約
-python process_papers.py en
-
-# 論文の言語に合わせて要約（デフォルト）
-python process_papers.py
+# 論文タイプも指定
+python process_papers.py empirical paper.pdf
 ```
 
-### 論文タイプと言語を両方指定
+### 要約言語
 
-```bash
-# 実証論文を日本語で要約
-python process_papers.py empirical ja
-
-# 理論論文を英語で要約
-python process_papers.py theoretical en
-
-# レビュー論文を日本語で要約
-python process_papers.py review ja
-
-# 順序は自由（タイプと言語を判別）
-python process_papers.py ja empirical
-```
+論文本文から自動判定されます（日本語の論文は日本語、それ以外は英語）。
 
 ### ヘルプの表示
 
@@ -113,8 +100,8 @@ $ python process_papers.py empirical ja
   📋 指定タイプ: empirical
   📁 ディレクトリ作成: MyPage/Research/empirical/strategic_management_2024
   📦 PDF移動完了
-  🤖 Claude API呼び出し中 ⠹
-  ✅ Claude API呼び出し完了
+  🤖 Claude呼び出し中 ⠹
+  ✅ Claude呼び出し完了
   ✅ 保存完了: summary.md
 
 ============================================================
@@ -144,19 +131,14 @@ MyPage/Research/
 
 ## コスト
 
-- Claude Sonnet 4.5使用
-- 1論文あたり約10円
-- 月30本処理で約300円
+- Claudeサブスクの利用枠を消費（API課金なし）
 
 ## トラブルシューティング
 
-### エラー: ANTHROPIC_API_KEYが設定されていません
+### エラー: claude コマンドが見つかりません
 
-`.env`ファイルにAPI keyを設定してください：
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxx
-```
+Claude Code をインストールし、`claude login` でサブスクにログインしてください。
+`.env` に `ANTHROPIC_API_KEY` が残っているとAPI課金になるため、削除してください。
 
 ### エラー: プロンプトファイルが見つかりません
 

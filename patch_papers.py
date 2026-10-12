@@ -9,7 +9,6 @@ empirical / theoretical / review ディレクトリ内の *_summary.md のうち
 from __future__ import annotations
 
 from pathlib import Path
-import anthropic
 import PyPDF2
 import os
 import re
@@ -17,11 +16,11 @@ import sys
 import time
 import threading
 from dotenv import load_dotenv
+from claude_cli import run_claude
 
 
 class PaperPatcher:
-    def __init__(self, api_key: str, research_dir: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, research_dir: str):
         self.research_dir = Path(research_dir)
         self.paper_dirs = [
             self.research_dir / "empirical",
@@ -55,20 +54,11 @@ class PaperPatcher:
             "- キーワードは論文中で実際に使われている用語を優先すること\n"
             "- テーブル以外のテキストは一切出力しないこと"
         )
-        response = self.client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1000,
-            system=[{
-                "type": "text",
-                "text": static_instruction,
-                "cache_control": {"type": "ephemeral"}
-            }],
-            messages=[{
-                "role": "user",
-                "content": f"論文テキスト（冒頭部分）:\n{text[:8000]}"
-            }],
+        return run_claude(
+            static_instruction,
+            f"論文テキスト（冒頭部分）:\n{text[:8000]}",
+            "claude-haiku-4-5",
         )
-        return response.content[0].text.strip()
 
     # ------------------------------------------------------------------
     # 参考文献抽出（process_papers.py と同ロジック）
@@ -94,20 +84,11 @@ class PaperPatcher:
             "- 見出し行（REFERENCESなど）は除いてください\n"
             "- リスト以外のテキストは一切出力しないこと"
         )
-        response = self.client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=4000,
-            system=[{
-                "type": "text",
-                "text": static_instruction,
-                "cache_control": {"type": "ephemeral"}
-            }],
-            messages=[{
-                "role": "user",
-                "content": f"参考文献セクション:\n{refs_text}"
-            }],
+        return run_claude(
+            static_instruction,
+            f"参考文献セクション:\n{refs_text}",
+            "claude-haiku-4-5",
         )
-        return response.content[0].text.strip()
 
     # ------------------------------------------------------------------
     # 処理対象サマリーを収集
@@ -243,12 +224,7 @@ class PaperPatcher:
 def main():
     load_dotenv()
 
-    api_key = os.getenv("ANTHROPIC_API_KEY")
     vault_path = os.getenv("OBSIDIAN_VAULT_PATH")
-
-    if not api_key:
-        print("❌ エラー: ANTHROPIC_API_KEY が設定されていません")
-        sys.exit(1)
 
     if not vault_path:
         print("❌ エラー: OBSIDIAN_VAULT_PATH が設定されていません")
@@ -259,7 +235,7 @@ def main():
         print(f"❌ エラー: Management/papers ディレクトリが見つかりません: {research_dir}")
         sys.exit(1)
 
-    patcher = PaperPatcher(api_key, research_dir)
+    patcher = PaperPatcher(research_dir)
 
     # ファイル指定がある場合はそのファイルのみ処理
     if len(sys.argv) > 1:

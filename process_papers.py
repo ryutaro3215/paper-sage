@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Paper Sage - 論文自動要約システム
-経営学論文をタイプ別に分類し、Claude APIで要約を生成
+経営学論文をタイプ別に分類し、Claude Code CLI（サブスク）で要約を生成
 """
 
 from pathlib import Path
 from typing import Optional
-import anthropic
 import httpx
 import PyPDF2
 from datetime import datetime
@@ -18,11 +17,11 @@ import time
 import shutil
 import re
 import json
+from claude_cli import run_claude
 
 class PaperProcessor:
     # 要約生成用モデル。論文テキストはこのモデルへの1回の呼び出しでのみ入力する
     SUMMARY_MODEL = "claude-sonnet-5"
-    SUMMARY_MAX_TOKENS = 64000
 
     # 要約本文の後に続けて出力させる付録（重要キーワード）と、frontmatter 用のコンセプト
     APPENDIX_INSTRUCTIONS = """【追加出力】上記の出力形式ルールに加えて、要約本文（最後の項目）の後に、続けて以下のセクションと <concepts> ブロックをこの順で出力してください。本文と同じ言語方針に従ってください。
@@ -41,6 +40,13 @@ ConceptOne
 ConceptTwo
 </concepts>"""
 
+    # 実証論文のみ、<concepts> の直前に研究手法タグ（tags に追加）を出力させる
+    METHODS_INSTRUCTIONS = """【追加出力（実証論文のみ）】<concepts> ブロックの直前に、この論文が用いた研究手法を <methods> タグの中に1〜3個、`Methodology/<手法名>` の形（手法名はCamelCase、例: Methodology/PanelRegression, Methodology/DifferenceInDifferences, Methodology/AgentBasedModel, Methodology/CaseStudy）で1行1つずつ出力する。タグの外には何も書かないこと。
+
+<methods>
+Methodology/MethodOne
+</methods>"""
+
     # 論文タイプ判定用（TypeSafe AI Jev）
     JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
     JEV_MODEL = "jev-latest"
@@ -49,8 +55,7 @@ ConceptTwo
     JEV_STATE_CHARS = 20000
     JEV_MAX_RETRIES = 3
 
-    def __init__(self, api_key, vault_path, jev_api_key):
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, vault_path, jev_api_key):
         self.jev_api_key = jev_api_key
         self.vault_path = Path(vault_path)
         self.research_dir = self.vault_path / "MyPage/Management"
@@ -156,24 +161,70 @@ ConceptTwo
             "登録済み概念一覧:\n" + '\n'.join(f'- {c}' for c in existing)
         )
 
-    def _build_system(self, paper_type, cache):
-        """要約・付録・コンセプトを1回で出力させるシステムプロンプトを組み立てる（出力言語は英語固定）"""
+    @staticmethod
+    def detect_language(text):
+        """論文本文の言語を判定する（かな・漢字の割合が高ければ ja、それ以外は en）"""
+        sample = text[:5000]
+        letters = [c for c in sample if c.isalpha()]
+        if not letters:
+            return "en"
+        ja = sum(1 for c in letters if '\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff')
+        return "ja" if ja / len(letters) > 0.3 else "en"
+
+    def _build_system(self, paper_type, cache, language="en"):
+        """要約・付録・コンセプトを1回で出力させるシステムプロンプトを組み立てる（日本語論文は日本語、それ以外は英語）"""
         static_system = (
             f"{self.system_prompt}\n\n---\n\n"
             f"{self.prompts[paper_type]}\n\n---\n\n{self.APPENDIX_INSTRUCTIONS}"
         )
-        # 論文間で共通のプレフィックスをキャッシュする（最後のブロックに付けると両ブロックが対象）
-        return [
-            {"type": "text", "text": static_system},
-            {"type": "text", "text": self._concept_registry_text(cache),
-             "cache_control": {"type": "ephemeral"}},
-        ]
+        if paper_type == 'empirical':
+            static_system += f"\n\n---\n\n{self.METHODS_INSTRUCTIONS}"
+        system = f"{static_system}\n\n---\n\n{self._concept_registry_text(cache)}"
+        if paper_type == 'empirical':
+            system += f"\n\n---\n\n{self._method_registry_text(cache)}"
+        if language == "ja":
+            system += (
+                "\n\n---\n\n【出力言語の上書き】この論文は日本語で書かれています。"
+                "上記の言語に関する指定（英語で出力する等）に関わらず、要約本文・見出し・付録の説明をすべて日本語で出力してください。"
+                "ただし <concepts> と <methods> の値は登録済み一覧との整合のため、指定された形式のまま出力してください。"
+            )
+        return system
+
+    def _registered_method_tags(self, cache: Optional[dict]) -> list[str]:
+        """cache.json の tag_registry.general から登録済みの Methodology/* タグを返す"""
+        general = ((cache or {}).get('tag_registry') or {}).get('general') or []
+        return sorted(t for t in general if t.startswith('Methodology/'))
+
+    def _method_registry_text(self, cache: Optional[dict]) -> str:
+        """登録済み Methodology/* タグを、既存タグを優先選択させる指示文に変換"""
+        existing = self._registered_method_tags(cache)
+        if not existing:
+            return "登録済み研究手法タグ: （なし）"
+        return (
+            "<methods> に出力する手法タグは、以下の登録済みタグから優先的に選ぶこと。"
+            "一覧にない手法が必要な場合のみ新規作成してよい。\n"
+            "登録済み研究手法タグ:\n" + '\n'.join(f'- {t}' for t in existing)
+        )
+
+    def _register_method_tags(self, methods: list[str]):
+        """未登録の Methodology/* タグを cache.json の tag_registry.general に登録する（vaultルール: 使う前に登録）"""
+        cache = self.load_cache()
+        general = cache.get('tag_registry', {}).get('general')
+        if not isinstance(general, list):
+            return
+        new = [m for m in methods if m not in general]
+        if not new:
+            return
+        general.extend(new)
+        try:
+            (self.vault_path / "wiki/cache.json").write_text(
+                json.dumps(cache, ensure_ascii=False, indent=2), encoding='utf-8')
+            print(f"  🏷️  手法タグを登録: {', '.join(new)}")
+        except Exception as e:
+            print(f"  ⚠️  cache.json 書き込み失敗: {e}")
 
     def _stream_message(self, system, user_content, label):
-        """Claude API を1回呼び出して全文を返す（ローディングアニメーション付き）
-
-        出力が長いため、HTTPタイムアウトを避けるようストリーミングで受信する。
-        """
+        """claude -p を1回呼び出して全文を返す（ローディングアニメーション付き）"""
         print(f"  🤖 {label}", end="", flush=True)
         stop_loading = threading.Event()
 
@@ -190,47 +241,40 @@ ConceptTwo
 
         is_complete = False
         try:
-            with self.client.messages.stream(
-                model=self.SUMMARY_MODEL,
-                max_tokens=self.SUMMARY_MAX_TOKENS,
-                system=system,
-                messages=[{"role": "user", "content": user_content}],
-            ) as stream:
-                message = stream.get_final_message()
-            if message.stop_reason == "refusal":
-                raise RuntimeError("Claude が要約を拒否しました (stop_reason: refusal)")
-            result = "".join(b.text for b in message.content if b.type == 'text')
-            is_complete = message.stop_reason != "max_tokens"
+            result = run_claude(system, user_content, self.SUMMARY_MODEL)
+            # 付録の最後の <concepts> ブロックまで出力されていれば完了とみなす
+            is_complete = "</concepts>" in result
         finally:
             stop_loading.set()
             loading_thread.join()
             if is_complete:
                 print(f"\r  ✅ {label}完了                    ")
             else:
-                print(f"\r  ⚠️  {label}: max_tokensに達したか失敗しました")
+                print(f"\r  ⚠️  {label}: 出力が不完全か失敗しました")
 
-        usage = message.usage
-        print(
-            f"  📊 tokens: input={usage.input_tokens:,} "
-            f"cache_read={usage.cache_read_input_tokens or 0:,} "
-            f"cache_write={usage.cache_creation_input_tokens or 0:,} "
-            f"output={usage.output_tokens:,}"
-        )
         return result, is_complete
 
-    def summarize(self, text, paper_type, cache=None):
+    def summarize(self, text, paper_type, cache=None, language="en"):
         """要約本文・キーワード・コンセプトを1回のAPI呼び出しで生成（論文は全文を入力）"""
         return self._stream_message(
-            self._build_system(paper_type, cache),
+            self._build_system(paper_type, cache, language),
             f"論文テキスト:\n{text}",
-            "Claude API呼び出し中",
+            "Claude呼び出し中",
         )
 
     def _parse_output(self, raw: str):
         """モデル出力から <concepts> を取り出し、付録セクションの区切り線を整える
 
-        Returns: (本文, concepts のリスト)
+        Returns: (本文, concepts のリスト, Methodology/* タグのリスト)
         """
+        methods = []
+        match = re.search(r'<methods>(.*?)</methods>', raw, re.DOTALL)
+        if match:
+            for l in match.group(1).splitlines():
+                m = l.strip().lstrip('- ').strip().lstrip('#')
+                if re.fullmatch(r'Methodology/[A-Za-z0-9]+', m) and m not in methods:
+                    methods.append(m)
+            raw = raw[:match.start()] + raw[match.end():]
         concepts = []
         match = re.search(r'<concepts>(.*?)</concepts>', raw, re.DOTALL)
         if match:
@@ -240,7 +284,7 @@ ConceptTwo
         body = raw.strip()
         # 付録セクションの前は常に「---」1本で区切る
         body = re.sub(r'\n+(?:---\n+)?(?=## 重要キーワード\n)', '\n\n---\n\n', body)
-        return body, concepts
+        return body, concepts, methods
 
     def load_cache(self) -> dict:
         """wiki/cache.json を読み込む（存在しない場合は空dictを返す）
@@ -275,10 +319,10 @@ ConceptTwo
             return body[:idx], body[idx:]
         return body, ''
 
-    def resume_summary(self, text, paper_type, existing_summary, cache=None):
+    def resume_summary(self, text, paper_type, existing_summary, cache=None, language="en"):
         """途中で切れた出力の続きを生成（システムプロンプトは通常時と共通にしてキャッシュを再利用）"""
         return self._stream_message(
-            self._build_system(paper_type, cache),
+            self._build_system(paper_type, cache, language),
             (
                 f"論文テキスト:\n{text}\n\n"
                 f"【既存の出力（途中まで）】:\n{existing_summary}\n\n"
@@ -315,6 +359,8 @@ ConceptTwo
         existing_content = summary_path.read_text(encoding='utf-8')
         type_match = re.search(r'^paper_type:\s*(\S+)', existing_content, re.MULTILINE)
         paper_type = type_match.group(1) if type_match else 'empirical'
+        lang_match = re.search(r'^language:\s*(\S+)', existing_content, re.MULTILINE)
+        language = lang_match.group(1) if lang_match else 'en'
 
         try:
             text = self.extract_text(pdf_path)
@@ -328,12 +374,12 @@ ConceptTwo
 
         try:
             continuation, is_complete = self.resume_summary(
-                text, paper_type, main_summary, self.load_cache())
+                text, paper_type, main_summary, self.load_cache(), language)
         except Exception as e:
             print(f"  ❌ 続き生成エラー: {e}")
             return False
 
-        generated, concepts = self._parse_output(main_summary + '\n\n' + continuation)
+        generated, concepts, methods = self._parse_output(main_summary + '\n\n' + continuation)
         full_summary = generated + appended
         status = 'complete' if is_complete else 'incomplete'
 
@@ -349,6 +395,13 @@ ConceptTwo
                 concept_yaml = ''.join(f'  - {c}\n' for c in concepts)
                 fm_block = re.sub(r'^concept:\n(?:  - .*\n)*', f'concept:\n{concept_yaml}',
                                   fm_block, count=1, flags=re.MULTILINE)
+            if methods and paper_type == 'empirical':
+                self._register_method_tags(methods)
+                missing = [m for m in methods if f'  - {m}\n' not in fm_block]
+                if missing:
+                    fm_block = re.sub(r'^(tags:\n(?:  - .*\n)*)',
+                                      lambda m: m.group(1) + ''.join(f'  - {t}\n' for t in missing),
+                                      fm_block, count=1, flags=re.MULTILINE)
             new_file_content = '---' + fm_block + '---\n\n' + full_summary
         else:
             new_file_content = full_summary
@@ -482,6 +535,9 @@ status: unprocessable
             print(f"  ❌ PDF読み込みエラー: {e}")
             return
         
+        language = self.detect_language(text)
+        print(f"  🌐 要約言語: {'日本語' if language == 'ja' else '英語'}")
+
         # 論文タイプ判定（指定がない場合）
         if paper_type is None:
             paper_type = self.detect_paper_type(text)
@@ -510,13 +566,15 @@ status: unprocessable
         # 要約・キーワード・コンセプトを1回の呼び出しで生成
         # （cache.json の concept_registry から既存概念を優先選択させる）
         try:
-            raw, is_complete = self.summarize(text, paper_type, self.load_cache())
+            raw, is_complete = self.summarize(text, paper_type, self.load_cache(), language)
         except Exception as e:
             print(f"  ❌ 要約エラー: {e}")
             # PDFを元に戻す
             new_pdf_path.rename(pdf_path)
             return
-        summary, concepts = self._parse_output(raw)
+        summary, concepts, methods = self._parse_output(raw)
+        if paper_type == 'empirical' and methods:
+            self._register_method_tags(methods)
 
         # 参考文献抽出（API呼び出しなし）
         try:
@@ -538,6 +596,7 @@ status: unprocessable
             'review': 'Paper/Review',
         }.get(paper_type, 'Paper/Empirical')
         concept_yaml = '\n'.join(f'  - {c}' for c in concepts) if concepts else '  - Management'
+        method_yaml = ''.join(f'  - {m}\n' for m in methods) if paper_type == 'empirical' else ''
         metadata = f"""---
 domain: Management
 concept:
@@ -547,9 +606,9 @@ tags:
   - Type/Fact
   - Source/Paper
   - {paper_type_tag}
-created: {datetime.now().isoformat()}
+{method_yaml}created: {datetime.now().isoformat()}
 paper_type: {paper_type}
-language: en
+language: {language}
 detail: simple
 source: "[[{pdf_path.name}]]"
 status: {status}
@@ -568,14 +627,8 @@ def main():
     load_dotenv()
     
     # 環境変数取得
-    api_key = os.getenv("ANTHROPIC_API_KEY")
     vault_path = os.getenv("OBSIDIAN_VAULT_PATH")
     jev_api_key = os.getenv("JEV_API_KEY")
-    
-    if not api_key:
-        print("❌ エラー: ANTHROPIC_API_KEYが設定されていません")
-        print("   .envファイルにAPI keyを設定してください")
-        sys.exit(1)
     
     if not vault_path:
         print("❌ エラー: OBSIDIAN_VAULT_PATHが設定されていません")
@@ -587,7 +640,7 @@ def main():
     
     # プロセッサー初期化
     try:
-        processor = PaperProcessor(api_key, vault_path, jev_api_key)
+        processor = PaperProcessor(vault_path, jev_api_key)
     except Exception as e:
         print(f"❌ 初期化エラー: {e}")
         sys.exit(1)
@@ -598,27 +651,22 @@ def main():
         print(f"   {processor.downloads_dir}")
         sys.exit(1)
     
-    # PDFファイル取得
-    pdfs = list(processor.downloads_dir.glob("*.pdf"))
-    
-    if not pdfs:
-        print("✅ 処理するPDFはありません")
-        print(f"   PDFを {processor.downloads_dir} に配置してください")
-        return
-    
     # コマンドライン引数の処理
     paper_type = None
     rescue_mode = False
+    target_name = None
 
     # 使用方法の表示
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
         print("\n使用方法:")
-        print("  python process_papers.py [論文タイプ] [--rescue]")
+        print("  python process_papers.py [論文タイプ] [ファイル名.pdf] [--rescue]")
         print("\n論文タイプ:")
         print("  empirical    - 実証論文")
         print("  theoretical  - 理論論文")
         print("  review       - レビュー論文")
         print("  (指定なし)   - 自動判定（通常モードのみ）")
+        print("\nファイル名:")
+        print("  downloads内のPDFを1本だけ指定して処理（指定なしは全件）")
         print("\nオプション:")
         print("  --rescue     - PDFを指定タイプに移動してフロントマターのみのサマリーを作成（要約しない）")
         print("                 論文タイプの指定が必須")
@@ -626,6 +674,8 @@ def main():
         print("  python process_papers.py empirical")
         print("  python process_papers.py review")
         print("  python process_papers.py")
+        print("  python process_papers.py paper.pdf")
+        print("  python process_papers.py empirical paper.pdf")
         print("  python process_papers.py empirical --rescue")
         sys.exit(0)
 
@@ -641,6 +691,10 @@ def main():
         elif arg_lower in ['empirical', 'theoretical', 'review']:
             paper_type = arg_lower
 
+        # 対象PDFの指定（downloads内のファイル名）
+        elif arg_lower.endswith('.pdf'):
+            target_name = Path(arg).name
+
         # 不明な引数
         else:
             print(f"⚠️  警告: 不明な引数 '{arg}'")
@@ -651,6 +705,22 @@ def main():
         print("❌ エラー: --rescue モードでは論文タイプ (empirical/theoretical/review) の指定が必須です")
         print("   例: python process_papers.py empirical --rescue")
         sys.exit(1)
+
+    # PDFファイル取得
+    if target_name:
+        target = processor.downloads_dir / target_name
+        if not target.is_file():
+            print(f"❌ エラー: {target_name} が downloads に見つかりません")
+            print(f"   {processor.downloads_dir}")
+            sys.exit(1)
+        pdfs = [target]
+    else:
+        pdfs = sorted(processor.downloads_dir.glob("*.pdf"))
+
+    if not pdfs:
+        print("✅ 処理するPDFはありません")
+        print(f"   PDFを {processor.downloads_dir} に配置してください")
+        return
 
     if rescue_mode:
         print(f"\n🚑 レスキューモード: {paper_type}")
@@ -679,7 +749,7 @@ def main():
     else:
         print(f"\n📌 論文タイプ: 自動判定")
 
-    print(f"🌐 要約言語: 英語")
+    print(f"🌐 要約言語: 論文ごとに自動判定（日本語論文は日本語、それ以外は英語）")
 
     # 処理開始
     print(f"\n{'='*60}")
